@@ -890,35 +890,12 @@ impl Dwc3Regs {
     }
 
     pub async fn core_soft_reset(&self, kernel: &Kernel) {
-        // Before Resetting PHY, put Core in Reset
-        self.globals().gctl.modify(GCTL::CORESOFTRESET::Reset);
-
-        // Assert USB3 PHY reset
-        self.globals()
-            .gusb3pipectl0
-            .modify(GUSB3PIPECTL::PHYSOFTRST::Reset);
-
-        self.globals()
-            .gusb2phycfg0
-            .modify(GUSB2PHYCFG::PHYSOFTRST::Reset);
-
-        kernel.delay(Duration::from_millis(100));
-
-        // Clear USB3 PHY reset
-        self.globals()
-            .gusb3pipectl0
-            .modify(GUSB3PIPECTL::PHYSOFTRST::Normal);
-
-        // Clear USB2 PHY reset
-        self.globals()
-            .gusb2phycfg0
-            .modify(GUSB2PHYCFG::PHYSOFTRST::Normal);
-
-        kernel.delay(Duration::from_millis(100));
-
-        // After PHYs are stable we can take Core out of reset state
-        self.globals().gctl.modify(GCTL::CORESOFTRESET::Normal);
-
-        debug!("DWC3: Core soft reset completed");
+        log::warn!("DWC3: 🔥 拦截原版软复位！防止 RK3588 U3 PHY 时钟被级联误杀！");
+        
+        // 核心寄存器操作全部删掉！
+        // 假装我们已经花时间做完了复位，直接给个延迟就完事
+        kernel.delay(Duration::from_millis(10));
+        
+        debug!("DWC3: Core soft reset Bypassed (Hack for RK3588)");
     }
 }

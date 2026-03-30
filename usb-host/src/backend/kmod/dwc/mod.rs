@@ -122,6 +122,7 @@ pub struct DwcParams {
 /// DWC3 的 xHCI 寄存器区域 (0x0000 - 0x7fff) 包含标准 xHCI 寄存器，
 /// 全局寄存器区域 (0xc100 - 0xcfff) 包含 DWC3 特定配置。
 pub struct Dwc {
+    mmio_base: usize,
     xhci: Xhci,
     usb3_phy: Udphy,
     usb2_phy: Usb2Phy,
@@ -138,7 +139,7 @@ pub struct Dwc {
 impl Dwc {
     pub fn new(mut params: DwcNewParams<'_, impl CruOp>) -> Result<Self> {
         let mmio_base = params.ctrl.as_ptr() as usize;
-        params.params.max_speed = Speed::Full;
+        params.params.max_speed = Speed::SuperSpeed;
         let cru = Arc::new(params.cru);
         let xhci = Xhci::new(params.ctrl, params.kernel)?;
 
@@ -153,6 +154,7 @@ impl Dwc {
         }
 
         Ok(Self {
+            mmio_base,
             xhci,
             dwc_regs,
             usb3_phy: phy,
@@ -507,6 +509,10 @@ impl Dwc {
 
         debug!("DWC3: PHY configuration completed");
 
+        
+        let final_gusb3 = self.dwc_regs.globals().gusb3pipectl0.extract();
+        info!("DWC3: GUSB3PIPECTL after phy_setup = {:#010x}", final_gusb3.get());
+
         Ok(())
     }
 
@@ -557,14 +563,40 @@ impl Dwc {
         match self.dr_mode {
             DrMode::Host => {
                 info!("DWC3: Initializing in HOST mode");
-                self.dwc_regs.globals().gctl.modify(GCTL::PRTCAPDIR::Host);
+                let gctl_ptr = (self.mmio_base + 0xc110) as *mut u32;
+                unsafe {
+                    let gctl = gctl_ptr.read_volatile();
+                    info!("DWC3: GCTL before = {:#010x}", gctl);
+                    
+                    // 🎯 修复：写入 1 才是真正的 Host 模式！
+                    let gctl_new = (gctl & !(0x3 << 12)) | (1 << 12);
+                    gctl_ptr.write_volatile(gctl_new);
+                    
+                    let gctl_after = gctl_ptr.read_volatile();
+                    info!("DWC3: GCTL after  = {:#010x} (bits[13:12]={})", 
+                        gctl_after, (gctl_after >> 12) & 0x3);
+                }
+                // 等待 CURMODE=1
+                let gsts_ptr = (self.mmio_base + 0xc118) as *const u32;
+                let mut timeout = 0u32;
+                loop {
+                    let gsts = unsafe { gsts_ptr.read_volatile() };
+                    let curmode = gsts & 0x3;
+                    if curmode == 1 {
+                        info!("DWC3: CURMODE=Host ✅ GSTS={:#010x}", gsts);
+                        break;
+                    }
+                    timeout += 1;
+                    if timeout > 100_000 {
+                        warn!("HOST mode timeout! GSTS={:#010x}", gsts);
+                        break;
+                    }
+                    for _ in 0..100 { core::hint::spin_loop(); }
+                }
             }
-            DrMode::Otg => {
-                todo!()
-            }
-            DrMode::Peripheral => todo!(),
+            DrMode::Otg => { todo!() }
+            DrMode::Peripheral => { todo!() }
         }
-
         Ok(())
     }
 
@@ -649,35 +681,67 @@ impl Dwc {
     ///
     /// **关键点**：DWC3 PHY 配置寄存器必须在 xHCI 执行 HCRST **之后**才能访问，
     /// 因为 HCRST 会复位并使能 host block 的 PHY 接口。
-    async fn _init(&mut self) -> Result {
+    async fn _init(&mut self) -> Result<()> {
         info!("DWC3: Starting controller initialization");
-
-        /*
-         * It must hold whole USB3.0 OTG controller in resetting to hold pipe
-         * power state in P2 before initializing TypeC PHY on RK3399 platform.
-         */
-        for &id in self.rsts.values() {
-            self.cru.reset_assert(id);
-        }
-
-        self.kernel().delay(core::time::Duration::from_millis(1));
-        // 初始化 USB2 PHY（需要在 xHCI HCRST 之前）
-        self.usb2_phy.setup().await?;
-
-        let kernel = self.kernel().clone();
-        self.usb3_phy.setup(&kernel).await?;
-
+        
+        // 🎯 修复：先释放 CRU 硬件复位，让 PHY 和控制器通电起振
         for &id in self.rsts.values() {
             self.cru.reset_deassert(id);
         }
+        self.kernel().delay(core::time::Duration::from_millis(50)); // 给充足时间起振
 
+        // 🎯 修复：然后再去配置 PHY 的寄存器
+        self.usb2_phy.setup().await?;
+        let kernel = self.kernel().clone();
+        self.usb3_phy.setup(&kernel).await?;
+
+        log::info!("dwc3_init start");
         self.dwc3_init().await?;
-
+        log::info!("dwc3_init end");
+        
+        unsafe {
+                    // 这是你 OS 映射的 U3 PHY 虚拟地址
+                    let phy_ptr = 0xffff9000fed90000_usize as *mut u32;
+                    // 写入 0x0040 寄存器，解除 CMN_DP_RSTN 锁死
+                    core::ptr::write_volatile(phy_ptr.add(0x40 / 4), 0x00000003);
+                    log::warn!(" 终极强心剂注入：已强制释放 PHY 数字核心时钟！");
+                    
+                    // 给时钟 1 毫秒的起振和总线同步时间
+                    for _ in 0..1_000_000 { core::hint::spin_loop(); }
+                }
+        // =====================================================================
+        
+        // 轮询等待 xHCI Operational 寄存器有响应
+        {
+            let op_base = (self.mmio_base + 0x20) as *const u32;
+            let mut count = 0u32;
+            loop {
+                // 如果时钟注入成功，这里的 read_volatile 就绝对不会挂死了！
+                let usbcmd = unsafe { op_base.read_volatile() };
+                let usbsts = unsafe { op_base.add(1).read_volatile() };
+                
+                if count % 10_000 == 0 {
+                    info!("wait xHCI: USBCMD={:#010x} USBSTS={:#010x} count={}", 
+                        usbcmd, usbsts, count);
+                }
+                if usbsts != 0x00000000 && usbsts != 0xffffffff {
+                    info!("xHCI ready! USBSTS={:#010x}", usbsts);
+                    break;
+                }
+                count += 1;
+                if count > 500_000 {
+                    warn!("xHCI Operational 永远是0，硬件未响应！");
+                    break;
+                }
+                for _ in 0..100 { core::hint::spin_loop(); }
+            }
+        }
+        
+        log::info!("xhci_init start");
         self.xhci.init().await?;
-
-        // 输出关键寄存器状态用于调试
-        self.dump_registers();
-
+        log::info!("dwc3_init end");
+        
+        self.dump_registers();  
         Ok(())
     }
 }

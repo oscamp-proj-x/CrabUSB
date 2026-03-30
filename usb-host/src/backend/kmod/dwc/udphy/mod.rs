@@ -185,16 +185,32 @@ impl Udphy {
         debug!("24M reference clock configured");
 
         // Step 3: configure lane mux
+        // USB-only 模式：lane0/1 给 USB，lane2/3 不用
+        let lane_en = |i: usize| -> bool {
+            if self.mode.contains(UdphyMode::USB) && self.lane_mux_sel[i] == 0 {
+                // 这条 lane 分配给 USB，且当前是 USB 模式 → Enable
+                true
+            } else {
+                false
+                // DP lane 的 EN 由后面 dplane_enable() 负责
+            }
+        };
+
         self.cmn_lane_mux_and_en().write(
             CMN_LANE_MUX_EN::LANE0_MUX.val(self.lane_mux_sel[0])
                 + CMN_LANE_MUX_EN::LANE1_MUX.val(self.lane_mux_sel[1])
                 + CMN_LANE_MUX_EN::LANE2_MUX.val(self.lane_mux_sel[2])
                 + CMN_LANE_MUX_EN::LANE3_MUX.val(self.lane_mux_sel[3])
-                + CMN_LANE_MUX_EN::LANE0_EN::Disable
-                + CMN_LANE_MUX_EN::LANE1_EN::Disable
-                + CMN_LANE_MUX_EN::LANE2_EN::Disable
-                + CMN_LANE_MUX_EN::LANE3_EN::Disable,
+                + if lane_en(0) { CMN_LANE_MUX_EN::LANE0_EN::Enable } 
+                else { CMN_LANE_MUX_EN::LANE0_EN::Disable }
+                + if lane_en(1) { CMN_LANE_MUX_EN::LANE1_EN::Enable }
+                else { CMN_LANE_MUX_EN::LANE1_EN::Disable }
+                + if lane_en(2) { CMN_LANE_MUX_EN::LANE2_EN::Enable }
+                else { CMN_LANE_MUX_EN::LANE2_EN::Disable }
+                + if lane_en(3) { CMN_LANE_MUX_EN::LANE3_EN::Enable }
+                else { CMN_LANE_MUX_EN::LANE3_EN::Disable },
         );
+        info!("lane init ok");
         // Step 4: deassert init rstn and wait for 200ns from datasheet
         if self.mode.contains(UdphyMode::USB) {
             self.reset_deassert("init");
@@ -211,6 +227,23 @@ impl Udphy {
             self.reset_deassert("cmn");
             self.reset_deassert("lane");
         }
+
+
+        self.cmn_lane_mux_and_en().write(
+        CMN_LANE_MUX_EN::LANE0_MUX.val(self.lane_mux_sel[0])
+            + CMN_LANE_MUX_EN::LANE1_MUX.val(self.lane_mux_sel[1])
+            + CMN_LANE_MUX_EN::LANE2_MUX.val(self.lane_mux_sel[2])
+            + CMN_LANE_MUX_EN::LANE3_MUX.val(self.lane_mux_sel[3])
+            + if lane_en(0) { CMN_LANE_MUX_EN::LANE0_EN::Enable }
+            else { CMN_LANE_MUX_EN::LANE0_EN::Disable }
+            + if lane_en(1) { CMN_LANE_MUX_EN::LANE1_EN::Enable }
+            else { CMN_LANE_MUX_EN::LANE1_EN::Disable }
+            + if lane_en(2) { CMN_LANE_MUX_EN::LANE2_EN::Enable }
+            else { CMN_LANE_MUX_EN::LANE2_EN::Disable }
+            + if lane_en(3) { CMN_LANE_MUX_EN::LANE3_EN::Enable }
+            else { CMN_LANE_MUX_EN::LANE3_EN::Disable },
+    );
+        info!("lane EN configured after reset deassert");
         //  Step 6: wait for lock done of pll
         self.status_check().await;
         info!("Udphy initialized");
@@ -287,13 +320,13 @@ impl Udphy {
     fn dplane_enable(&self, lanes: usize) {
         // Disable all DP lanes and assert common reset when DP is unused
         if lanes == 0 {
-            self.cmn_lane_mux_and_en().modify(
-                CMN_LANE_MUX_EN::LANE0_EN::Disable
-                    + CMN_LANE_MUX_EN::LANE1_EN::Disable
-                    + CMN_LANE_MUX_EN::LANE2_EN::Disable
-                    + CMN_LANE_MUX_EN::LANE3_EN::Disable,
-            );
-            self.cmn_dp_rstn().modify(CMN_DP_RSTN::DP_CMN_RSTN::Reset);
+            // self.cmn_lane_mux_and_en().modify(
+            //     CMN_LANE_MUX_EN::LANE0_EN::Disable
+            //         + CMN_LANE_MUX_EN::LANE1_EN::Disable
+            //         + CMN_LANE_MUX_EN::LANE2_EN::Disable
+            //         + CMN_LANE_MUX_EN::LANE3_EN::Disable,
+            // );
+            //self.cmn_dp_rstn().modify(CMN_DP_RSTN::DP_CMN_RSTN::Reset);
             return;
         }
 

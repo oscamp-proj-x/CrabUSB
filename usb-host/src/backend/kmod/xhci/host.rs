@@ -83,6 +83,14 @@ impl CoreOp for Xhci {
 
 impl Xhci {
     pub fn new(mmio: Mmio, kernel: &'static dyn KernelOp) -> Result<Self> {
+        unsafe {
+            let base = mmio.as_ptr() as *const u32;
+            for offset in [0x0, 0x4, 0x8, 0x10, 0x20, 0x40, 0x80, 0x100] {
+                let val = base.byte_add(offset).read_volatile();
+                info!("DWC3[{:#x}] = {:#010x}", offset, val);
+            }
+        }
+        
         let reg = XhciRegisters::new(mmio);
 
         // 检查 xHCI 控制器的寻址能力（HCCPARAMS1 寄存器）
@@ -137,6 +145,7 @@ impl Xhci {
     }
 
     async fn _init(&mut self) -> Result {
+        log::info!("xhci_init start go=========>");
         self.disable_irq();
         // 4.2 Host Controller Initialization
         self.init_ext_caps().await?;
@@ -200,7 +209,14 @@ impl Xhci {
     }
 
     async fn chip_hardware_reset(&mut self) -> Result {
+
         debug!("Reset begin ...");
+
+        info!("xHCI: before reset - HCHalted={} CNR={} RUN_STOP={}",
+        self.reg.read().operational.usbsts.read_volatile().hc_halted(),
+        self.reg.read().operational.usbsts.read_volatile().controller_not_ready(),
+        self.reg.read().operational.usbcmd.read_volatile().run_stop(),
+        );
         self.reg.write().operational.usbcmd.update_volatile(|c| {
             c.clear_run_stop();
         });
